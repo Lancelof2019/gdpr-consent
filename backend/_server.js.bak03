@@ -1,0 +1,197 @@
+// backend/server.js
+const express = require("express");
+const cors    = require("cors");
+const mysql   = require("mysql2/promise");
+const path    = require("path");
+const crypto  = require("crypto")
+const app = express();
+
+// 托管静态文件
+//app.use(express.static(path.join(__dirname, "..", "public")));
+
+app.use(express.static("/var/www/html/gdpr-consent/public"));
+
+// CORS 和 JSON body
+app.use(cors());
+app.use(express.json({ limit: "5mb" }));
+
+////////////
+// —— MySQL 连接池配置 —— 
+const pool = mysql.createPool({
+  host:     "172.31.40.187",   // 🔧 MySQL 服务器 IP（你的是 192.168.242.133）
+  port:     3306,                // 🔧 MySQL 端口，通常是 3306
+  user:     "demoast",          // 🔧 数据库用户名
+  password: "Passw0rd@123!",   // 🔧 对应用户名的密码
+  database: "resume_candidate",  // 🔧 数据库名（你的库是 resume_candidate）
+  waitForConnections: true,
+  connectionLimit:    10
+});
+
+// ✅ 接口：生成唯一 token（绑定用户）
+app.post("/api/generate-token", async (req, res) => {
+  try {
+    const { candidate_id } = req.body;
+    if (!candidate_id) return res.status(400).json({ error: "Missing candidate_id" });
+
+    const token = crypto.randomBytes(16).toString("hex");
+    const expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    await pool.execute(
+      `INSERT INTO consent_tokens (candidate_id, token, expires_at) VALUES (?, ?, ?)`,
+      [candidate_id, token, expires_at]
+    );
+
+    res.json({ token, sign_url: `/sign?token=${token}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to generate token" });
+  }
+});
+
+// ✅ 接口：用户访问签字页面验证 token
+app.get("/sign", async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(400).send("❌ Missing token");
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT * FROM consent_tokens WHERE token = ?`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).send("❌ Invalid token");
+
+    const record = rows[0];
+    if (record.used) return res.status(403).send("❌ This token has already been used.");
+    if (record.expires_at && new Date(record.expires_at) < new Date()) {
+      return res.status(403).send("❌ Token expired.");
+    }
+
+    res.sendFile(path.join("/var/www/html/gdpr-consent/public", "index.html"));
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("❌ Internal error");
+  }
+});
+
+
+
+// MySQL 连接池（替换为你的凭据）
+//const pool = mysql.createPool({
+//  host:     "localhost",
+ // user:     "api_user",         // 或 root
+  //password: "strong_password",  // 对应密码
+  //database: "resume_candidate",
+ // waitForConnections: true,
+ // connectionLimit:    10
+//});
+
+// 接口：保存签名
+/*app.post("/api/consent", async (req, res) => {
+  try {
+    const { candidate_id, signature,signed_at, signature_data } = req.body;
+    if (!candidate_id || !signature|| !signed_at || !signature_data) {
+      return res.status(400).json({ error: "Missing candidate_id or signature" });
+    }
+    const imgBuffer = Buffer.from(signature, "base64");
+    const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+    //const [result] = await pool.execute(
+     // `INSERT INTO candidate_signatures(candidate_id, signature_blob)
+     //  VALUES (?, ?)`, 
+     // [candidate_id, imgBuffer]
+   // );
+    const [result] = await pool.execute(
+      `INSERT INTO candidate_signatures
+         (candidate_id, signature_blob, signed_at, ip_address, user_agent, signature_data)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        candidate_id,
+        imgBuffer,
+        signed_at,
+        ip,
+        userAgent,
+        JSON.stringify(signature_data)
+      ]
+    );
+    res.json({ success: true, insertId: result.insertId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+*/
+
+
+
+app.post("/api/consent", async (req, res) => {
+  try {
+    const { token, signature, signed_at, signature_data } = req.body;
+    if (!token || !signature || !signed_at || !signature_data) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT * FROM consent_tokens WHERE token = ?`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Invalid token" });
+    const t = rows[0];
+    if (t.used) return res.status(403).json({ error: "Token already used" });
+
+    const imgBuffer = Buffer.from(signature, "base64");
+    const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+
+    await pool.execute(
+      `INSERT INTO candidate_signatures
+         (candidate_id, signature_blob, signed_at, ip_address, user_agent, signature_data)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [t.candidate_id, imgBuffer, signed_at, ip, userAgent, JSON.stringify(signature_data)]
+    );
+
+    await pool.execute(`UPDATE consent_tokens SET used = TRUE WHERE token = ?`, [token]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+// GET /api/signature?id=123
+app.get("/api/signature", async (req, res) => {
+  const id = parseInt(req.query.id, 10);
+  if (!id) {
+    return res.status(400).json({ error: "Missing id" });
+  }
+  try {
+    const [rows] = await pool.execute(
+      "SELECT signature_blob FROM candidate_signatures WHERE id = ?",
+      [id]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: "Not found" });
+    }
+    const blob = rows[0].signature_blob;
+    // 假设存的是 PNG，如果是 JPEG 请改成 'jpeg'
+    res.type("png");
+    res.send(blob);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+//end 
+
+
+// SPA fallback
+app.get("*", (req, res) => {
+  res.sendFile(path.join("/var/www/html/gdpr-consent/public", "index.html"));
+});
+
+// 启动
+const PORT = 3000;
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+

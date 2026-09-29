@@ -1,0 +1,165 @@
+// backend/server.js
+const express = require("express");
+const cors    = require("cors");
+const mysql   = require("mysql2/promise");
+const path    = require("path");
+const crypto  = require("crypto");
+const nodemailer = require("nodemailer");
+
+const app = express();
+
+// 静态资源路径
+app.use(express.static("/var/www/html/gdpr-consent/public"));
+
+// CORS + JSON 解析
+app.use(cors());
+app.use(express.json({ limit: "5mb" }));
+
+// MySQL 配置
+const pool = mysql.createPool({
+  host:     "172.31.40.187",
+  port:     3306,
+  user:     "demoast",
+  password: "Passw0rd@123!",
+  database: "resume_candidate",
+  waitForConnections: true,
+  connectionLimit:    10
+});
+
+// 邮件发送配置（请替换为你自己的邮箱和密码）
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: "your_email@gmail.com",
+    pass: "your_app_password"
+  }
+});
+
+const ADMIN_SECRET = "MySecretAdminKey"; // 管理员密钥
+
+// ✅ 接口：生成唯一 token（绑定用户）并发送邮件，仅管理员可调用
+app.post("/api/generate-token", async (req, res) => {
+  try {
+    const { email, admin_secret } = req.body;
+    if (!email || admin_secret !== ADMIN_SECRET) {
+      return res.status(403).json({ error: "Unauthorized" });
+    }
+
+    // 自动插入 candidate_id（可选拓展为 candidate 表）
+    const [result] = await pool.execute(
+      `INSERT INTO candidates (email) VALUES (?)`,
+      [email]
+    );
+    const candidate_id = result.insertId;
+
+    const token = crypto.randomBytes(16).toString("hex");
+    const expires_at = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+    await pool.execute(
+      `INSERT INTO consent_tokens (candidate_id, token, expires_at) VALUES (?, ?, ?)`,
+      [candidate_id, token, expires_at]
+    );
+
+    const signUrl = `http://your-domain.com:3000/sign?token=${token}`;
+
+    await transporter.sendMail({
+      from: "your_email@gmail.com",
+      to: email,
+      subject: "请签署 GDPR 协议",
+      html: `<p>请点击以下链接签署协议：</p><p><a href="${signUrl}">${signUrl}</a></p>`
+    });
+
+    res.json({ token, sign_url: signUrl });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to generate token or send email" });
+  }
+});
+
+// ✅ 接口：用户访问签字页面验证 token
+app.get("/sign", async (req, res) => {
+  const token = req.query.token;
+  if (!token) return res.status(400).send("❌ Missing token");
+
+  try {
+    const [rows] = await pool.execute(
+      `SELECT * FROM consent_tokens WHERE token = ?`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).send("❌ Invalid token");
+
+    const record = rows[0];
+    if (record.used) return res.status(403).send("❌ This token has already been used.");
+    if (record.expires_at && new Date(record.expires_at) < new Date()) {
+      return res.status(403).send("❌ Token expired.");
+    }
+
+    res.sendFile(path.join("/var/www/html/gdpr-consent/public", "index.html"));
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("❌ Internal error");
+  }
+});
+
+// ✅ 接口：提交签字（token 自动识别 candidate）
+app.post("/api/consent", async (req, res) => {
+  try {
+    const { token, signature, signed_at, signature_data } = req.body;
+    if (!token || !signature || !signed_at || !signature_data) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    const [rows] = await pool.execute(
+      `SELECT * FROM consent_tokens WHERE token = ?`,
+      [token]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Invalid token" });
+    const t = rows[0];
+    if (t.used) return res.status(403).json({ error: "Token already used" });
+
+    const imgBuffer = Buffer.from(signature, "base64");
+    const ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    const userAgent = req.headers['user-agent'];
+
+    await pool.execute(
+      `INSERT INTO candidate_signatures
+         (candidate_id, signature_blob, signed_at, ip_address, user_agent, signature_data)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [t.candidate_id, imgBuffer, signed_at, ip, userAgent, JSON.stringify(signature_data)]
+    );
+
+    await pool.execute(`UPDATE consent_tokens SET used = TRUE WHERE token = ?`, [token]);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// ✅ 显示签名图像
+app.get("/api/signature", async (req, res) => {
+  const id = parseInt(req.query.id, 10);
+  if (!id) return res.status(400).json({ error: "Missing id" });
+
+  try {
+    const [rows] = await pool.execute(
+      "SELECT signature_blob FROM candidate_signatures WHERE id = ?",
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Not found" });
+    res.type("png").send(rows[0].signature_blob);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// 默认 SPA fallback
+app.get("*", (req, res) => {
+  res.sendFile(path.join("/var/www/html/gdpr-consent/public", "index.html"));
+});
+
+const PORT = 3000;
+app.listen(PORT, () => console.log(`API listening on port ${PORT}`));
+
