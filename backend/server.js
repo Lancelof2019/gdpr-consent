@@ -43,10 +43,10 @@ function toMySQLDateTime(iso) {
 //////
 // MySQL 配置
 const pool = mysql.createPool({
-  host:     "115.29.41.53",
+  host:     "xxx",
   port:     3306,
   user:     "demoast",
-  password: "Passw0rd@123!",
+  password: "xxxx",
   database: "resume_candidate",
   waitForConnections: true,
   connectionLimit:    10
