@@ -52,7 +52,7 @@ const pool = mysql.createPool({
   connectionLimit:    10
 });
 
-const ADMIN_SECRET = "Passw0rd@123!"; // 管理员密钥
+const ADMIN_SECRET = "xxxxx"; // 管理员密钥
 const BASE_URL = "https://www.dl-futurehr.com/gdpr-consent";  // 外部访问地址
 /////////////////////////
 /*function buildAgreementHTML({ token, company, person_name, signed_name, signed_date, signatureBase64 }) {
